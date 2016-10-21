@@ -1,0 +1,128 @@
+// Mapping for packet tracing on the CPU
+static vector_size = 8;
+
+type Real = simd[f32 * 8];
+type Mask = simd[f32 * 8];
+type Intr = simd[i32 * 8];
+type HitFn = fn (Intr, Real, Real, Real) -> ();
+
+fn real(x: f32) -> Real { simd[x, x, x, x, x, x, x, x] }
+fn intr(x: i32) -> Intr { simd[x, x, x, x, x, x, x, x] }
+
+fn any(m: Mask) -> bool { movmskps256(m) != 0 }
+fn all(m: Mask) -> bool { movmskps256(m) == 0xFF }
+fn select_real(m: Mask, a: Real, b: Real) -> Real { blendvps256(b, a, m) }
+fn select_intr(m: Mask, a: Intr, b: Intr) -> Intr { bitcast8_f32_i32(blendvps256(bitcast8_i32_f32(b), bitcast8_i32_f32(a), m)) }
+
+fn abs_real(x: Real) -> Real { bitcast8_i32_f32(bitcast8_f32_i32(x) & intr(0x7FFFFFFF)) }
+fn rcp_real(x: Real) -> Real {
+    let r = rcpps256(x);
+    r * (real(2.0f) - x * r)
+}
+fn prodsign_real(x: Real, y: Real) -> Real { bitcast8_i32_f32(bitcast8_f32_i32(x) ^ (bitcast8_f32_i32(y) & intr(0x80000000))) }
+
+// Use integer instructions for min/max
+fn min_real(a: Real, b: Real) -> Real { bitcast8_i32_f32(select8_i32(bitcast8_f32_i32(a) < bitcast8_f32_i32(b), bitcast8_f32_i32(a), bitcast8_f32_i32(b))) }
+fn max_real(a: Real, b: Real) -> Real { bitcast8_i32_f32(select8_i32(bitcast8_f32_i32(a) > bitcast8_f32_i32(b), bitcast8_f32_i32(a), bitcast8_f32_i32(b))) }
+fn minmin_real(a: Real, b: Real, c: Real) -> Real { min_real(min_real(a, b), c) }
+fn maxmax_real(a: Real, b: Real, c: Real) -> Real { max_real(max_real(a, b), c) }
+fn minmax_real(a: Real, b: Real, c: Real) -> Real { max_real(min_real(a, b), c) }
+fn maxmin_real(a: Real, b: Real, c: Real) -> Real { min_real(max_real(a, b), c) }
+
+struct Node {
+    min_x: [f32 * 4], min_y: [f32 * 4], min_z: [f32 * 4],
+    max_x: [f32 * 4], max_y: [f32 * 4], max_z: [f32 * 4],
+    children: [i32 * 4]
+}
+
+fn iterate_triangles(nodes: &[Node], t: Real, stack: Stack, mut tris: &[Vec4], body: fn (Tri, Intr) -> ()) -> () {
+    // Cull this leaf if it is too far away
+    if all(greater_eq(stack.tmin(), t)) { return() }
+
+    let mut tri_id = !stack.top();
+    while true {
+        let tri_data = &tris(tri_id) as &[float];
+
+        for i in @unroll(0, 4) {
+            let v0 = vec3(real(tri_data( 0 + i)), real(tri_data( 4 + i)), real(tri_data( 8 + i)));
+            let e1 = vec3(real(tri_data(12 + i)), real(tri_data(16 + i)), real(tri_data(20 + i)));
+            let e2 = vec3(real(tri_data(24 + i)), real(tri_data(28 + i)), real(tri_data(32 + i)));
+            let n  = vec3(real(tri_data(36 + i)), real(tri_data(40 + i)), real(tri_data(44 + i)));
+
+            let tri = Tri {
+                v0: || { v0 },
+                e1: || { e1 },
+                e2: || { e2 },
+                n:  || { n }
+            };
+
+            body(tri, intr(tri_id));
+        }
+
+        if bitcast_f32_i32(tri_data(48)) == 0x80000000 {
+            break()
+        }
+
+        tri_id += 12;
+    }
+}
+
+fn iterate_children(nodes: &[Node], t: Real, stack: Stack, body: fn(Box, fn (Real, Real) -> ()) -> ()) -> () {
+    let node = nodes(stack.top());
+    let tmin = stack.tmin();
+    stack.pop();
+
+    // Cull this node if it is too far away
+    if all(tmin >= t) { return() }
+
+    for i in @unroll(0, 4) {
+        if node.children(i) == 0 { break() }
+
+        let box = Box {
+            min: || { vec3(real(node.min_x(i)), real(node.min_y(i)), real(node.min_z(i))) },
+            max: || { vec3(real(node.max_x(i)), real(node.max_y(i)), real(node.max_z(i))) }
+        };
+
+        body(box, |t0, t1| {
+            let t = select_real(t1 >= t0, t0, real(flt_max));
+            if any(t1 >= t0) {
+                if any(stack.tmin() > t) {
+                    stack.push_top(node.children(i), t)
+                } else {
+                    stack.push(node.children(i), t)
+                }
+            }
+        });
+    }
+}
+
+fn iterate_rays(rays: &[Ray], mut hits: &[Hit], ray_count: i32, body: fn (Vec3, Vec3, Real, Real, HitFn) -> ()) -> () {
+    for i in range_step(0, ray_count, vector_size) @{
+        let mut org: Vec3;
+        let mut dir: Vec3;
+        let mut tmin: Real;
+        let mut tmax: Real;
+
+        for j in @unroll(0, vector_size) {
+            org.x(j) = rays(i + j).org.x;
+            org.y(j) = rays(i + j).org.y;
+            org.z(j) = rays(i + j).org.z;
+
+            dir.x(j) = rays(i + j).dir.x;
+            dir.y(j) = rays(i + j).dir.y;
+            dir.z(j) = rays(i + j).dir.z;
+
+            tmin(j) = rays(i + j).org.w;
+            tmax(j) = rays(i + j).dir.w;
+        }
+
+        body(org, dir, tmin, tmax, |tri, t, u, v| {
+            for j in @unroll(0, vector_size) {
+                hits(i + j).tri_id = tri(j);
+                hits(i + j).tmax = t(j);
+                hits(i + j).u = u(j);
+                hits(i + j).v = v(j);
+            }
+        });
+    }
+}

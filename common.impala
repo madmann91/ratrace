@@ -1,0 +1,200 @@
+static flt_max = 1.0e+37f;
+
+struct Tri {
+    v0: fn () -> Vec3,
+    e1: fn () -> Vec3,
+    e2: fn () -> Vec3,
+    n:  fn () -> Vec3
+}
+
+struct Box {
+    min: fn () -> Vec3,
+    max: fn () -> Vec3
+}
+
+// Slabs ray box intersection test
+fn intersect_ray_box(oidir: Vec3, idir: Vec3, tmin: Real, tmax: Real, box: Box, intr: fn (Real, Real) -> ()) -> () {
+    fn span_begin(a: Real, b: Real, c: Real, d: Real, e: Real, f: Real, g: Real) -> Real {
+        maxmax_real(min_real(a, b), min_real(c, d), minmax_real(e, f, g))
+    }
+
+    fn span_end(a: Real, b: Real, c: Real, d: Real, e: Real, f: Real, g: Real) -> Real {
+        minmin_real(max_real(a, b), max_real(c, d), maxmin_real(e, f, g))
+    }
+
+    let min = box.min();
+    let max = box.max();
+
+    // oidir = org * idir is precomputed so we can use an fmsub instruction
+    let t0_x = min.x * idir.x - oidir.x;
+    let t1_x = max.x * idir.x - oidir.x;
+    let t0_y = min.y * idir.y - oidir.y;
+    let t1_y = max.y * idir.y - oidir.y;
+    let t0_z = min.z * idir.z - oidir.z;
+    let t1_z = max.z * idir.z - oidir.z;
+
+    let t0 = span_begin(t0_x, t1_x, t0_y, t1_y, t0_z, t1_z, tmin);
+    let t1 = span_end(t0_x, t1_x, t0_y, t1_y, t0_z, t1_z, tmax);
+
+    intr(t0, t1)
+}
+
+// Moeller-Trumbore triangle intersection algorithm
+fn intersect_ray_tri(org: Vec3, dir: Vec3, tmin: Real, tmax: Real, tri: Tri, intr: fn (Mask, Real, Real, Real) -> ()) -> () {
+    let v0 = tri.v0();
+    let e1 = tri.e1();
+    let e2 = tri.e2();
+    let n = tri.n();
+
+    let c = vec3_sub(v0, org);
+    let r = vec3_cross(dir, c);
+    let det = vec3_dot(n, dir);
+    let abs_det = abs_real(det);
+
+    // Postpone the division by det
+    let u = prodsign_real(vec3_dot(r, e2), det);
+    let mut mask = u >= real(0.0f);
+
+    let v = prodsign_real(vec3_dot(r, e1), det);
+    mask &= v >= real(0.0f);
+
+    let w = abs_det - u - v;
+    mask &= w >= real(0.0f);
+
+    if any(mask) {
+        let t = prodsign_real(vec3_dot(n, c), det);
+        mask &= (t >= abs_det * tmin) & (abs_det * tmax >= t);
+        mask &= det != real(0.0f);
+        if any(mask) {
+            let inv_det = rcp_real(abs_det);
+            intr(mask, t * inv_det, u * inv_det, v * inv_det);
+        }
+    }
+}
+
+// Functions to iterate over an interval
+type LoopFn = fn(i32) -> ();
+fn unroll(a: i32, b: i32, body: LoopFn) -> () {
+    if a < b {
+        body(a);
+        @unroll(a + 1, b, body, return)
+    }
+}
+
+fn range(a: i32, b: i32, body: LoopFn) -> () {
+    if a < b {
+        body(a);
+        range(a + 1, b, body, return)
+    }
+}
+
+fn range_step(a: i32, b: i32, c: i32, body: LoopFn) -> () {
+    if a < b {
+        body(a);
+        range_step(a + c, b, c, body, return)
+    }
+}
+
+type PushFn = fn (i32, Real) -> ();
+struct Stack {
+    push: PushFn,
+    push_top: PushFn,
+    set_top: PushFn,
+    pop: fn () -> (),
+    top: fn () -> i32,
+    tmin: fn() -> Real,
+    is_empty: fn () -> bool
+}
+
+fn is_leaf(node_id: i32) -> bool { node_id < 0 }
+
+fn allocate_stack() -> Stack {
+    let sentinel = 0x76543210u32;
+    let mut node_stack: [i32 * 64];
+    let mut tmin_stack: [Real * 64];
+    let mut id = -1;
+    // The top of the stack is stored as a separate variable
+    let mut top = sentinel as i32;
+    let mut tmin = real(flt_max);
+
+    Stack {
+        push: |n, t| {
+            id++;
+            node_stack(id) = n;
+            tmin_stack(id) = t;
+        },
+        push_top: |n, t| {
+            id++;
+            node_stack(id) = top;
+            tmin_stack(id) = tmin;
+            top = n;
+            tmin = t;
+        },
+        set_top: |n, t| {
+            top = n;
+            tmin = t;
+        },
+        pop: || {
+            top = node_stack(id);
+            tmin = tmin_stack(id);
+            id--;
+        },
+        top: || { top },
+        tmin: || { tmin },
+        is_empty: || { top == sentinel as i32 }
+    }
+}
+
+struct Ray {
+    org: Vec4,
+    dir: Vec4
+}
+
+struct Hit {
+    tri_id: i32,
+    tmax: f32,
+    u: f32,
+    v: f32
+}
+
+extern fn traverse_accel(nodes: &[Node], rays: &[Ray], tris: &[Vec4], hits: &[Hit], ray_count: i32) -> () {
+    for org, dir, tmin, tmax, record_hit in iterate_rays(rays, hits, ray_count) {
+        // Allocate a stack for the traversal
+        let stack = allocate_stack();
+
+        // Initialize traversal variables
+        let idir = vec3(rcp_real(dir.x), rcp_real(dir.y), rcp_real(dir.z));
+        let oidir = vec3_mul(idir, org);
+        let mut t = tmax;
+        let mut u = real(0.0f);
+        let mut v = real(0.0f);
+        let mut tri_id = intr(-1);
+
+        stack.push_top(0, tmin);
+
+        // Traversal loop
+        while !stack.is_empty() {
+            // Intersect children and update stack
+            for box, hit in iterate_children(nodes, t, stack) {
+                intersect_ray_box(oidir, idir, tmin, t, box, hit);
+            }
+
+            // Intersect leaves
+            while is_leaf(stack.top()) {
+                for tri, id in iterate_triangles(nodes, t, stack, tris) {
+                    intersect_ray_tri(org, dir, tmin, t, tri, |mask, t0, u0, v0| {
+                        t = select_real(mask, t0, t);
+                        u = select_real(mask, u0, u);
+                        v = select_real(mask, v0, v);
+                        tri_id = select_intr(mask, id, tri_id);
+                    });
+                }
+
+                // Pop node from the stack
+                stack.pop();
+            }
+        }
+
+        record_hit(tri_id, t, u, v);
+    }
+}
